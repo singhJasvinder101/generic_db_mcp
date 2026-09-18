@@ -1,0 +1,6 @@
+/generic-db-mcp
+/bin/
+.env
+*.log
+*.db
+*.sqlite
