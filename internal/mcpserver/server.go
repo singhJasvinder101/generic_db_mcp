@@ -58,13 +58,22 @@ func Build(adapter dbadapter.Adapter, cfg config.RuntimeConfig, embedder embeddi
 	if d.embedder != nil && d.vectors != nil {
 		mcp.AddTool(server, &mcp.Tool{
 			Name: "teach_schema_context",
-			Description: "Record what a table or column actually means in plain language — call this " +
+			Description: "Record what ONE table or column actually means in plain language — call this " +
 				"whenever a name alone is ambiguous or misleading (e.g. a table named 'tbl2' that " +
 				"actually holds orders, or a column whose values need business context to interpret). " +
-				"Re-calling with the same table+column replaces the previous note. This context is " +
-				"embedded and stored for search_schema_context to retrieve later, so future questions " +
-				"about the same table get it right instead of guessing from the name.",
+				"Re-calling with the same table+column replaces the previous note. If you're recording " +
+				"context for more than one table/column in the same turn (e.g. a user just explained " +
+				"their whole schema at once), use teach_schema_context_bulk instead of calling this " +
+				"tool repeatedly — it embeds and stores everything in one batch.",
 		}, d.teachSchemaContext)
+
+		mcp.AddTool(server, &mcp.Tool{
+			Name: "teach_schema_context_bulk",
+			Description: "Same as teach_schema_context, but for many tables/columns at once — one " +
+				"embedding batch and one storage write instead of one tool call per table. Use this " +
+				"whenever a user describes several tables/columns in a single message (e.g. walking " +
+				"through their whole schema) instead of calling teach_schema_context once per table.",
+		}, d.teachSchemaContextBulk)
 
 		mcp.AddTool(server, &mcp.Tool{
 			Name: "search_schema_context",
@@ -187,37 +196,75 @@ type teachSchemaContextOut struct {
 }
 
 func (d *deps) teachSchemaContext(ctx context.Context, _ *mcp.CallToolRequest, in teachSchemaContextIn) (*mcp.CallToolResult, teachSchemaContextOut, error) {
-	if in.Table == "" {
-		return nil, teachSchemaContextOut{}, fmt.Errorf("table is required")
-	}
-	if in.Description == "" {
-		return nil, teachSchemaContextOut{}, fmt.Errorf("description is required")
-	}
-
-	id := in.Schema + "." + in.Table
-	if in.Column != "" {
-		id += "." + in.Column
-	}
-
-	text := buildSchemaContextText(in)
-	vecs, err := d.embedder.Embed(ctx, []string{text})
+	ids, err := d.teachEntries(ctx, []teachSchemaContextIn{in})
 	if err != nil {
-		return nil, teachSchemaContextOut{}, fmt.Errorf("embedding context: %w", err)
+		return nil, teachSchemaContextOut{}, err
+	}
+	return nil, teachSchemaContextOut{ID: ids[0]}, nil
+}
+
+type teachSchemaContextBulkIn struct {
+	Entries []teachSchemaContextIn `json:"entries" jsonschema:"one entry per table/column to record context for — seed everything in one call instead of one tool call per table"`
+}
+
+type teachSchemaContextBulkOut struct {
+	IDs []string `json:"ids"`
+}
+
+func (d *deps) teachSchemaContextBulk(ctx context.Context, _ *mcp.CallToolRequest, in teachSchemaContextBulkIn) (*mcp.CallToolResult, teachSchemaContextBulkOut, error) {
+	ids, err := d.teachEntries(ctx, in.Entries)
+	if err != nil {
+		return nil, teachSchemaContextBulkOut{}, err
+	}
+	return nil, teachSchemaContextBulkOut{IDs: ids}, nil
+}
+
+// teachEntries embeds and stores every entry in a single batch: one call to
+// the embedding provider and one write to the vector store, regardless of
+// how many entries there are.
+func (d *deps) teachEntries(ctx context.Context, entries []teachSchemaContextIn) ([]string, error) {
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("at least one entry is required")
 	}
 
-	doc := vectorstore.Document{
-		ID:        id,
-		Schema:    in.Schema,
-		Table:     in.Table,
-		Column:    in.Column,
-		Text:      text,
-		Embedding: vecs[0],
-	}
-	if err := d.vectors.Upsert(ctx, []vectorstore.Document{doc}); err != nil {
-		return nil, teachSchemaContextOut{}, fmt.Errorf("storing context: %w", err)
+	ids := make([]string, len(entries))
+	texts := make([]string, len(entries))
+	for i, e := range entries {
+		if e.Table == "" {
+			return nil, fmt.Errorf("entries[%d]: table is required", i)
+		}
+		if e.Description == "" {
+			return nil, fmt.Errorf("entries[%d]: description is required", i)
+		}
+		id := e.Schema + "." + e.Table
+		if e.Column != "" {
+			id += "." + e.Column
+		}
+		ids[i] = id
+		texts[i] = buildSchemaContextText(e)
 	}
 
-	return nil, teachSchemaContextOut{ID: id}, nil
+	vecs, err := d.embedder.Embed(ctx, texts)
+	if err != nil {
+		return nil, fmt.Errorf("embedding context: %w", err)
+	}
+
+	docs := make([]vectorstore.Document, len(entries))
+	for i, e := range entries {
+		docs[i] = vectorstore.Document{
+			ID:        ids[i],
+			Schema:    e.Schema,
+			Table:     e.Table,
+			Column:    e.Column,
+			Text:      texts[i],
+			Embedding: vecs[i],
+		}
+	}
+	if err := d.vectors.Upsert(ctx, docs); err != nil {
+		return nil, fmt.Errorf("storing context: %w", err)
+	}
+
+	return ids, nil
 }
 
 func buildSchemaContextText(in teachSchemaContextIn) string {

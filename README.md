@@ -27,8 +27,9 @@ between engines.
 | `list_tables` | Every table with its columns, types, and primary/foreign keys. Cached; pass `refresh: true` after a schema change. |
 | `describe_table` | Full column detail for one table. |
 | `run_query` | Run one `SELECT` and get back rows, capped at `rowLimit` (default/max configurable). |
-| `teach_schema_context`* | Record what a table/column actually means in plain language — for when names are ambiguous or misleading. |
-| `search_schema_context`* | Semantic search over notes saved with `teach_schema_context`, so an agent can check for human-provided context before querying an unfamiliar table. |
+| `teach_schema_context`* | Record what one table/column actually means in plain language — for when names are ambiguous or misleading. |
+| `teach_schema_context_bulk`* | Same, for many tables/columns in one call (one embedding batch, one write) — use this when a user explains several tables at once. |
+| `search_schema_context`* | Semantic search over notes saved with `teach_schema_context`(`_bulk`), so an agent can check for human-provided context before querying an unfamiliar table. |
 
 \* Only registered when `SCHEMA_CONTEXT_ENABLED=true` — see "Schema business context" below.
 
@@ -100,6 +101,19 @@ teach_schema_context({
 })
 
 search_schema_context({ query: "where do we keep customer orders?" })
+```
+
+If a user explains several tables in one message (walking through their
+whole schema, say), the agent should reach for the bulk tool instead of
+calling `teach_schema_context` once per table:
+
+```
+teach_schema_context_bulk({
+  entries: [
+    { table: "tbl2", description: "Customer orders, not users. Renamed from 'orders_v2'.", aliases: ["orders"] },
+    { table: "usr_x", column: "flag_a", description: "1 = account is on the legacy billing plan, 0 = migrated." }
+  ]
+})
 ```
 
 The embedding provider and the vector store are both pluggable
