@@ -4,3 +4,4 @@
 *.log
 *.db
 *.sqlite
+schema_context.json
